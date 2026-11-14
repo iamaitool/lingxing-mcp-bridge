@@ -23,6 +23,7 @@ async function authorize(f,password=config.password) {
   const {client_id}=await registration.json();
   const page=await f.request('/authorize?'+new URLSearchParams({client_id,redirect_uri:callback,response_type:'code',code_challenge:challenge,code_challenge_method:'S256',resource:config.publicUrl+'/mcp',scope:'lingxing.read',state:'original-state'}));
   assert.equal(page.status,200);
+  assert.equal(page.headers.get('referrer-policy'),'same-origin');
   const cookie=page.headers.get('set-cookie').split(';')[0];
   const request_id=(await page.text()).match(/name="request_id" value="([^"]+)"/)[1];
   const login=await f.post('/authorize',{request_id,password},{Cookie:cookie,Origin:config.publicUrl});
@@ -114,4 +115,22 @@ test('upstream uses server key/session, parses SSE and initializes once',async()
   assert.equal(requests.filter(r=>r.method==='initialize').length,1);
   assert.equal(requests.at(-1).headers['Mcp-Session-Id'],'private-session');
   assert.ok(requests.every(r=>r.headers['X-Mcp-Key']==='test-server-side-key' && !r.headers.Authorization));
+});
+
+test('parallel login pages keep distinct CSRF cookies; null origin stays rejected',async t=>{
+  const f=await fixture(t);
+  const {client_id}=await (await f.post('/register',{redirect_uris:[callback]})).json();
+  const query=new URLSearchParams({client_id,redirect_uri:callback,response_type:'code',code_challenge:challenge,code_challenge_method:'S256'});
+  const pages=await Promise.all([f.request('/authorize?'+query),f.request('/authorize?'+query)]);
+  const cookies=pages.map(p=>p.headers.get('set-cookie').split(';')[0]);
+  assert.notEqual(cookies[0].split('=')[0],cookies[1].split('=')[0]);
+  const ids=await Promise.all(pages.map(async p=>(await p.text()).match(/name="request_id" value="([^"]+)"/)[1]));
+  const headers={Cookie:cookies.join('; '),Origin:config.publicUrl};
+  const rejected=await f.post('/authorize',{request_id:ids[0],password:config.password},{...headers,Origin:'null'});
+  assert.equal(rejected.status,403);
+  assert.match((await rejected.json()).error,/origin/);
+  const missing=await f.post('/authorize',{request_id:ids[0],password:config.password},{Origin:config.publicUrl});
+  assert.equal(missing.status,403);
+  assert.match((await missing.json()).error,/cookie/);
+  for(const request_id of ids) assert.equal((await f.post('/authorize',{request_id,password:config.password},headers)).status,303);
 });

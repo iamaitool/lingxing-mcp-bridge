@@ -124,7 +124,9 @@ export function createBridge(config, upstream = new Lingxing(config.key)) {
   const server = http.createServer(async (req,res) => {
     res.setHeader('Cache-Control','no-store');
     res.setHeader('X-Content-Type-Options','nosniff');
-    res.setHeader('Referrer-Policy','no-referrer');
+    // Keep the form POST Origin available for strict CSRF origin validation.
+    // same-origin also prevents OAuth query strings leaking to other origins.
+    res.setHeader('Referrer-Policy','same-origin');
     res.setHeader('Content-Security-Policy',"default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'");
     const json = (status, value) => {res.writeHead(status, {'Content-Type':'application/json; charset=utf-8'}); res.end(JSON.stringify(value));};
     const html = text => {res.writeHead(200, {'Content-Type':'text/html; charset=utf-8'}); res.end(text);};
@@ -155,19 +157,22 @@ export function createBridge(config, upstream = new Lingxing(config.key)) {
         if (pending.size >= 1000) throw fail(429,'Too many pending logins');
         const requestId = random(); const csrf = random();
         pending.set(requestId, {...q, csrf:hash(csrf), expires:now()+600});
-        res.setHeader('Set-Cookie',`lx_csrf=${csrf}; Path=/authorize; HttpOnly; Secure; SameSite=Lax; Max-Age=600`);
+        res.setHeader('Set-Cookie',`lx_csrf_${requestId}=${csrf}; Path=/authorize; HttpOnly; Secure; SameSite=Lax; Max-Age=600`);
         return html(`<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>连接领星 MCP</title><style>body{font:16px system-ui;background:#f5f7fb;color:#172033;max-width:440px;margin:10vh auto;padding:24px}main{background:white;padding:32px;border-radius:18px}input,button{box-sizing:border-box;width:100%;padding:14px;margin-top:18px;font:inherit}button{background:#2463eb;color:white;border:0;border-radius:8px}</style><main><h1>连接领星 MCP</h1><p>允许 ChatGPT 查询你的商品、销售、库存、利润和广告报表。</p><p>请输入你在 Render 设置的中转服务密码。<strong>此处不填写领星密钥。</strong></p><form method="POST" action="/authorize"><input type="hidden" name="request_id" value="${requestId}"><label>中转服务密码<input name="password" type="password" required autocomplete="current-password" maxlength="512"></label><button type="submit">登录并授权只读查询</button></form></main></html>`);
       }
       if (path === '/authorize' && req.method === 'POST') {
         limit('password', 10); const form = await body(req); const auth = pending.get(form.request_id);
-        const cookie = req.headers.cookie?.match(/(?:^|;\s*)lx_csrf=([^;]+)/)?.[1];
-        if (req.headers.origin !== base || !auth || auth.expires <= now() || !cookie || !equal(auth.csrf,hash(cookie))) throw fail(400,'Login expired. Reconnect from ChatGPT.');
+        const cookies = Object.fromEntries((req.headers.cookie || '').split(';').map(s => s.trim().split('=')));
+        const cookie = cookies['lx_csrf_' + form.request_id];
+        if (!auth || auth.expires <= now()) throw fail(400,'Login expired. Close this page and reconnect from ChatGPT.');
+        if (req.headers.origin !== base) throw fail(403,'Login origin could not be verified. Close this page and reconnect from ChatGPT.');
+        if (!cookie || !equal(auth.csrf,hash(cookie))) throw fail(403,'Login cookie missing or invalid. Allow cookies for this service and reconnect from ChatGPT.');
         if (!equal(form.password || '',config.password)) throw fail(403,'Incorrect bridge password. Reconnect from ChatGPT to try again.');
         pending.delete(form.request_id);
         const code = random(); codes.set(code,{...auth, expires:now()+120});
         const redirect = new URL(auth.redirect_uri); redirect.searchParams.set('code',code); redirect.searchParams.set('iss',base);
         if (auth.state) redirect.searchParams.set('state',auth.state);
-        res.writeHead(303, {Location:redirect.href, 'Set-Cookie':'lx_csrf=; Path=/authorize; HttpOnly; Secure; SameSite=Lax; Max-Age=0'}); return res.end();
+        res.writeHead(303, {Location:redirect.href, 'Set-Cookie':`lx_csrf_${form.request_id}=; Path=/authorize; HttpOnly; Secure; SameSite=Lax; Max-Age=0`}); return res.end();
       }
       if (path === '/token' && req.method === 'POST') {
         limit('token', 60); const form = await body(req);
