@@ -134,3 +134,19 @@ test('parallel login pages keep distinct CSRF cookies; null origin stays rejecte
   assert.match((await missing.json()).error,/cookie/);
   for(const request_id of ids) assert.equal((await f.post('/authorize',{request_id,password:config.password},headers)).status,303);
 });
+
+test('login form survives server replacement and rejects forged signed state',async t=>{
+  const old=await fixture(t);
+  const {client_id}=await (await old.post('/register',{redirect_uris:[callback]})).json();
+  const query=new URLSearchParams({client_id,redirect_uri:callback,response_type:'code',code_challenge:challenge,code_challenge_method:'S256',state:'restart-test'});
+  const page=await old.request('/authorize?'+query);
+  const cookie=page.headers.get('set-cookie').split(';')[0];
+  const request_id=(await page.text()).match(/name="request_id" value="([^"]+)"/)[1];
+  const replacement=await fixture(t);
+  const headers={Cookie:cookie,Origin:config.publicUrl};
+  const forged=await replacement.post('/authorize',{request_id:request_id+'tamper',password:config.password},headers);
+  assert.equal(forged.status,400);
+  const accepted=await replacement.post('/authorize',{request_id,password:config.password},headers);
+  assert.equal(accepted.status,303);
+  assert.equal(new URL(accepted.headers.get('location')).searchParams.get('state'),'restart-test');
+});

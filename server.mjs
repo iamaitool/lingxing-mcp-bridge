@@ -90,7 +90,7 @@ export function createBridge(config, upstream = new Lingxing(config.key)) {
   const base = new URL(config.publicUrl).origin;
   if (new URL(base).protocol !== 'https:' && !config.testing) throw new Error('PUBLIC_URL must use HTTPS');
   const configured = !!(config.key && config.password?.length >= 16 && config.signingKey?.length >= 32);
-  const pending = new Map(); const codes = new Map(); const budgets = new Map();
+  const codes = new Map(); const budgets = new Map();
   const now = () => Math.floor(Date.now()/1000);
   const sign = (type, claims, ttl) => {
     const payload = Buffer.from(JSON.stringify({...claims, type, iss:base, exp:now()+ttl})).toString('base64url');
@@ -111,7 +111,7 @@ export function createBridge(config, upstream = new Lingxing(config.key)) {
     else if (++entry.n > count) throw fail(429, 'Too many requests; try again in one minute');
   }
   const timer = setInterval(() => {
-    for (const map of [pending, codes]) for (const [k,v] of map) if (v.expires < now()) map.delete(k);
+    for (const map of [codes]) for (const [k,v] of map) if (v.expires < now()) map.delete(k);
     for (const [k,v] of budgets) if (v.until < now()) budgets.delete(k);
   }, 60000).unref();
   function callbackAllowed(uri) {
@@ -154,25 +154,29 @@ export function createBridge(config, upstream = new Lingxing(config.key)) {
         if (q.response_type !== 'code' || q.code_challenge_method !== 'S256' || !/^[A-Za-z0-9_-]{43}$/.test(q.code_challenge || '')) throw fail(400,'Authorization code with S256 PKCE is required');
         if (q.resource && q.resource !== base+'/mcp') throw fail(400,'Invalid resource');
         if (q.scope && q.scope !== SCOPE) throw fail(400,'Invalid scope');
-        if (pending.size >= 1000) throw fail(429,'Too many pending logins');
-        const requestId = random(); const csrf = random();
-        pending.set(requestId, {...q, csrf:hash(csrf), expires:now()+600});
-        res.setHeader('Set-Cookie',`lx_csrf_${requestId}=${csrf}; Path=/authorize; HttpOnly; Secure; SameSite=Lax; Max-Age=600`);
+        if ((q.state || '').length > 2048) throw fail(400,'OAuth state too large');
+        const csrf = random();
+        // Signed form state survives instance replacement; only its browser has the CSRF cookie.
+        const requestId = sign('login', {client_id:q.client_id,redirect_uri:q.redirect_uri,code_challenge:q.code_challenge,state:q.state || '',csrf:hash(csrf),nonce:random()},900);
+        const cookieId = hash(requestId);
+        res.setHeader('Set-Cookie',`lx_csrf_${cookieId}=${csrf}; Path=/authorize; HttpOnly; Secure; SameSite=Lax; Max-Age=900`);
         return html(`<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>连接领星 MCP</title><style>body{font:16px system-ui;background:#f5f7fb;color:#172033;max-width:440px;margin:10vh auto;padding:24px}main{background:white;padding:32px;border-radius:18px}input,button{box-sizing:border-box;width:100%;padding:14px;margin-top:18px;font:inherit}button{background:#2463eb;color:white;border:0;border-radius:8px}</style><main><h1>连接领星 MCP</h1><p>允许 ChatGPT 查询你的商品、销售、库存、利润和广告报表。</p><p>请输入你在 Render 设置的中转服务密码。<strong>此处不填写领星密钥。</strong></p><form method="POST" action="/authorize"><input type="hidden" name="request_id" value="${requestId}"><label>中转服务密码<input name="password" type="password" required autocomplete="current-password" maxlength="512"></label><button type="submit">登录并授权只读查询</button></form></main></html>`);
       }
       if (path === '/authorize' && req.method === 'POST') {
-        limit('password', 10); const form = await body(req); const auth = pending.get(form.request_id);
+        limit('password', 10); const form = await body(req);
+        let auth;
+        try { auth = verify(form.request_id,'login'); }
+        catch { throw fail(400,'Login expired. Close this page and reconnect from ChatGPT.'); }
         const cookies = Object.fromEntries((req.headers.cookie || '').split(';').map(s => s.trim().split('=')));
-        const cookie = cookies['lx_csrf_' + form.request_id];
-        if (!auth || auth.expires <= now()) throw fail(400,'Login expired. Close this page and reconnect from ChatGPT.');
+        const cookieId = hash(form.request_id);
+        const cookie = cookies['lx_csrf_' + cookieId];
         if (req.headers.origin !== base) throw fail(403,'Login origin could not be verified. Close this page and reconnect from ChatGPT.');
         if (!cookie || !equal(auth.csrf,hash(cookie))) throw fail(403,'Login cookie missing or invalid. Allow cookies for this service and reconnect from ChatGPT.');
         if (!equal(form.password || '',config.password)) throw fail(403,'Incorrect bridge password. Reconnect from ChatGPT to try again.');
-        pending.delete(form.request_id);
         const code = random(); codes.set(code,{...auth, expires:now()+120});
         const redirect = new URL(auth.redirect_uri); redirect.searchParams.set('code',code); redirect.searchParams.set('iss',base);
         if (auth.state) redirect.searchParams.set('state',auth.state);
-        res.writeHead(303, {Location:redirect.href, 'Set-Cookie':`lx_csrf_${form.request_id}=; Path=/authorize; HttpOnly; Secure; SameSite=Lax; Max-Age=0`}); return res.end();
+        res.writeHead(303, {Location:redirect.href, 'Set-Cookie':`lx_csrf_${cookieId}=; Path=/authorize; HttpOnly; Secure; SameSite=Lax; Max-Age=0`}); return res.end();
       }
       if (path === '/token' && req.method === 'POST') {
         limit('token', 60); const form = await body(req);
